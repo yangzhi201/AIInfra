@@ -137,15 +137,77 @@ class Adapter(nn.Module):
 
 ## 2. Prefix-tuning
 
-Prefix
-① 比Adapter更轻量化
-② 复杂任务上比完全微调要差（注意adapter和Prefix、Prompt那篇论文）
-③ 数据稀缺时表现更好
-④ 泛化能力更强
-⑤ Prefix的长度不是越长越好
-⑥ 只在第一层Prefix的话效果不好
-⑦ Prefix和Infix的比较
-⑧ Prefix的初始化
+> Li X L, Liang P. Prefix-tuning: Optimizing continuous prompts for generation[J]. arXiv preprint arXiv:2101.00190, 2021.
+
+介绍完 Adapter，接下来介绍一个比它**更轻量级**且能达到同样甚至更好效果（其实不总是能达到更好效果，需要看任务复杂程度）的方法——Prefix-tuning。我们还是首先介绍一下它的方法，然后再介绍它相比于其它方法的优缺点和一些消融相关实验。
+
+### 模型架构
+
+先前介绍的 Adapter 所需要的参数大约占模型参数的 3%，而 Prefix-tuning 只需要大约 0.1% 左右。那么它是怎么做的呢？
+
+下图的上半部分是常规注意力层，对于某一注意力层，假设有 N 个 Token（此处 N=3），每个 Token 都有自己的 $q_i$、$k_i$、$v_i$向量，其中 $i$ 是 Token 的索引，对于第 $i$ 个 Token，它需要拿它的 $q_i$ 与其它 Token 的 $k_j (1≤j≤N)$  计算得到对应的分数 $s_j$，再将分数去与对应的 $v_j$ 加权求和，得到该 Token 的输出 $o_i$。
+
+下图的下半部分则是 Prefix-tuning ，在注意力层的 N 个 Token 前面加上 T（此处 T=2） 个可学习的参数 $k_t$ 和  $v_t$（**注意！！！没有** $q_t$**！！！**），称之为 prefix。在第 $i$ 个 Token 计算其输出时，它不仅仅需要拿它的  $q_i$ 与其它 Token 的 $k_j (1≤j≤N)$  计算得到对应的分数 $s_j$，而是还需要考虑这些 prefix，即 $q_i$ 与当前层各个 prefix 以及其它 Token 的 $k_j (1≤j≤T+N)$  计算得到对应的分数 $s_j$，再与对应的 $v_j$ 加权求和得到最终的输出 $o_i$。
+
+注意，如果模型由 $L$ 个注意力层构成，那么在**每层**都会加上**相应独立非共享**的 Prefix。
+
+![image-20251116152007168](./images/02Prompt-base05.png)
+
+```python
+# 代码来源：https://github.com/huggingface/peft/blob/main/src/peft/tuners/prefix_tuning/model.py
+import torch
+class PrefixEncoder(torch.nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.prefix_projection = config.prefix_projection
+        token_dim = config.token_dim
+        num_layers = config.num_layers
+        encoder_hidden_size = config.encoder_hidden_size
+        num_virtual_tokens = config.num_virtual_tokens
+        if self.prefix_projection and not config.inference_mode: # 这里是重参数化部分，下面会讲
+            # Use a two-layer MLP to encode the prefix
+            # 总参数量：T × dim + dim × en_size + en_size + en_size × N × 2 × dim + N × 2 × dim
+            self.embedding = torch.nn.Embedding(num_virtual_tokens, token_dim) # 参数量：T × dim
+            self.transform = torch.nn.Sequential(
+                torch.nn.Linear(token_dim, encoder_hidden_size), # 参数量：dim × en_size + en_size
+                torch.nn.Tanh(),
+                torch.nn.Linear(encoder_hidden_size, num_layers * 2 * token_dim), # 参数量：en_size × N × 2 × dim + N × 2 × dim
+            )
+        else: # 为 num_layers（即上文提的L层），每层生成num_virtual_tokens个k_i和v_i
+            # 参数量：L × T × 2 × dim
+            self.embedding = torch.nn.Embedding(num_virtual_tokens, num_layers * 2 * token_dim)
+        
+    def forward(self, prefix: torch.Tensor):
+        if self.prefix_projection:
+            prefix_tokens = self.embedding(prefix)
+            past_key_values = self.transform(prefix_tokens)
+        else:
+            past_key_values = self.embedding(prefix)
+        return past_key_values
+```
+
+### 实现细节
+
+实现细节有四个，第一个是 Prefix 是放在输入 Token 的前面，而非中间或后面；第二个是对于每一个注意力层，都添加了 Prefix，并且这些 Prefix 之间相互独立不共享；第三个则是对 Prefix 的重参数化；第四个是初始化策略，这点见实验结论部分。
+
+论文中说明，如果直接对 Prefix 进行学习训练，这个 Prefix 对学习率和初始化十分敏感，甚至会使得模型性能下降。因此论文提出了对 Prefix 进行重参数化。结合上面的代码很好理解，重参数化即**不是直接**去学习那个巨大的、包含所有层激活值的前缀矩阵，而是通过学习两个**新的**、**辅助性的**参数，来**间接生成**这个前缀矩阵。在推理阶段，我们可以将已训练好的线性层和嵌入层通过计算进行合并，使得推理时参数数量减少到与重参数化前一致。
+
+总而言之，重参数化是在训练阶段引入额外的训练参数，以更好地优化模型，在推理阶段将参数丢弃，只保留由它们计算生成的最终前缀矩阵。在增加了训练成本但不增加推理成本的情况下使得模型训练更稳定丝滑。至于为什么这能行，还需读者自行去了解重参数化相关知识$^{[4]}$，此处不多介绍。
+
+### 实验结论
+
+**Prefix-tuning 能够通过更少的参数达到更佳的效果。**但并不总是如此，得看任务的复杂程度，在简单任务上，Prefix-tuning 能通过更少的参数达到更佳的效果，但是随着任务复杂，Adapter 和全量微调则可能会反超。
+
+**当训练数据较少时，Prefix-tuning 可能比完全微调效果要好。**
+
+**泛化能力更强。**由于 Prefix-tuning 对原始模型改变微小，因此在某一特定下游任务训练后，相比于 Adapter 和全量微调也能对其它任务保持较好的泛化能力。
+
+**Prefix 的长度不是越长越好。**对于不同的任务，Prefix 的最佳长度不一样，并非越长越好，太长反而会导致性能下降，后续的 Prompt-tuning、P-tuning 也有类似的结论。
+
+**只在第一层 Prefix 的话效果不好。**如果只在模型的输入层进行 Prefix，性能会大打折扣，因此，在中间的注意力层和后面的注意力层进行 Prefix 是有必要的。
+**Prefix 和 Infix 的比较。** Infix 的意思是说在 Token 序列的中间加参数，相比于 Prefix 而言，Infix 的效果不如 Prefix。
+
+**Prefix的初始化。** Prefix 的初始化也是个技术活，当训练数据较少时，初始化的影响更大。作者探究了三种初始化方式，一种是随机初始化，一种是拿词表中与下游任务不相关的词向量进行初始化，还有一种是拿词表中与下游任务强相关的词向量进行初始化。实验结果表明这三种方式带来的性能是递增的。
 
 ## 3. Prompt-tuning & P-tuning
 
@@ -196,3 +258,7 @@ Prompt tuning和P tuning的区别：Prompt tuning在输入的开头加，并且�
 [1] Houlsby N, Giurgiu A, Jastrzebski S, et al. Parameter-efficient transfer learning for NLP[C]//International conference on machine learning. PMLR, 2019: 2790-2799.
 
 [2] ValizadehAslani T, Liang H. LayerNorm: A key component in parameter-efficient fine-tuning[J]. arXiv preprint arXiv:2403.20284, 2024.
+
+[3] Li X L, Liang P. Prefix-tuning: Optimizing continuous prompts for generation[J]. arXiv preprint arXiv:2101.00190, 2021.
+
+[4] https://zhuanlan.zhihu.com/p/361090497
