@@ -275,12 +275,27 @@ $\mathbf{P}^* = \arg\min_{\mathbf{P}} \left\| \mathbf{Y} - Q(\mathbf{X}\mathbf{P
 
 $X \in R^{k×n}$为输入激活值，$W \in R^{m×n}$为权重矩阵，$Q(·)$为量化函数，$P \in R^{n×n}$为可逆的仿射变换矩阵。
 
-在这一步，模型首先需要对输入的激活和权重张量进行重塑：
+为了解决全尺寸矩阵P计算开销大的问题，FlatQuant 使用 Kronecker 分解：
 
+$\mathbf{P} = \mathbf{P}_1 \otimes \mathbf{P}_2$
+
+其中,$P_1 \in R^{n_1 \times n_1}$,$P_2 \in R^{n_2 \times n_2}$,$n=n_1 \times n_2$。
+
+此处，矩阵尺寸的最优配置通过以下方式确定：
+$$
+n_1^*, n_2^* = \arg\min (n_1 + n_2) \quad \text{s.t.} \quad n_1 n_2 = n \ \text{and} \ n_1 \leq n_2
+$$
+
+例如，隐藏层维度 n = 8192，则其最优分解为：(n₁, n₂) = (64, 128)。
+
+为了具体实现这一分解，模型首先需要对输入的激活和权重张量进行重塑：
+
+$$
 \begin{aligned}
 \tilde{\mathbf{X}} &= \text{reshape}(\mathbf{X}) \in \mathbb{R}^{k \times n_1 \times n_2} \\
 \tilde{\mathbf{W}} &= \text{reshape}(\mathbf{W}) \in \mathbb{R}^{m \times n_1 \times n_2}
 \end{aligned}
+$$
 
 之后利用 Kronecker 积的性质，对变换后的激活和权重张量进行如下计算：
 
@@ -290,14 +305,29 @@ $\mathbf{W}' = \mathbf{P}_1^{-1} \times_1 \tilde{\mathbf{W}} \times_2 (\mathbf{P
 
 其中$x_i$表示在第i个模式上的张量-矩阵乘法。
 
-这一步中依据的是大矩阵乘法与分步的小矩阵乘法之间的等价关系
+这一步中依据的是大矩阵乘法与分步的小矩阵乘法之间的等价关系，这一部分在后面的张量积计算中进行详细介绍。
+
+之后量化变化后的张量：
+
+$$
+\begin{aligned}
+\hat{\mathbf{X}} &= Q(\mathbf{X}') \\
+\hat{\mathbf{W}} &= Q(\mathbf{W}')
+\end{aligned}
+$$
+
+以最小化重构误差为目标学习仿射变换的分解矩阵、逐通道缩放向量和可学习裁剪阈值四组参数。通过梯度下降调整所有可学习参数，直到量化后的模块输出与原始模块输出的差异（Frobenius范数的平方）最小化。
+
+$$
+\min_{\mathbf{P}_1, \mathbf{P}_2, \mathbf{c}, \alpha} \left\| \mathcal{F}_l(\mathbf{X}) - \hat{\mathcal{F}}_l(\mathbf{X}; \Theta) \right\|_F^2
+$$
 
 #### 2. 应用变换与量化
 
 
 ### 适用阶段及策略
 
-### 方法和实验讨论
+### 方法讨论 -张量积
 
 ## 混合精度量化
 ### 计算过程
